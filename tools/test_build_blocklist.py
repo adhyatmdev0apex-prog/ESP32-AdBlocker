@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Tests for build_blocklist.py — verifies hashing, normalization, binary format,
 and Bloom filter correctness. Run: python3 tools/test_build_blocklist.py"""
-import sys, os, struct, tempfile, math
+import sys, os, struct, tempfile, math, zlib
+from bisect import bisect_left
 
 sys.path.insert(0, os.path.dirname(__file__))
 from build_blocklist import (
     fnv64, fnv40, norm, optimal_k, bloom_positions,
-    HASH_BYTES, MASK, FNV_OFFSET, FNV_PRIME, MAGIC, VERSION, HEADER_SIZE
+    extract_domains, HASH_BYTES, MASK, FNV_OFFSET, FNV_PRIME, MAGIC, VERSION, HEADER_SIZE
 )
 
 PASS = 0
@@ -44,6 +45,24 @@ check('norm strips trailing dot', norm('evil.com.') == 'evil.com')
 check('norm strips leading *.', norm('*.wildcard.com') == 'wildcard.com')
 check('norm keeps bare domain', norm('example.net') == 'example.net')
 check('norm keeps multi-level', norm('a.b.c.d') == 'a.b.c.d')
+check('norm IDNA-encodes Unicode', norm('bücher.example') == 'xn--bcher-kva.example')
+check('norm rejects empty labels', norm('a..example') == '')
+check('norm rejects malformed labels', norm('-bad.example') == '')
+check('hosts IPv4 syntax', extract_domains('0.0.0.0 ads.example.com # comment') == ['ads.example.com'])
+check('hosts IPv6 syntax', extract_domains('2001:db8::1 tracker.example.net') == ['tracker.example.net'])
+check('plain domains syntax', extract_domains('plain.example.org') == ['plain.example.org'])
+check('ABP domain rule', extract_domains('||abp.example.com^$third-party') == ['abp.example.com'])
+check('ABP exception is not converted to a block', extract_domains('@@||allowed.example.com^') == [])
+check('ABP path rules are not over-broadened', extract_domains('||path.example.com/ads.js') == [])
+check('ABP cosmetic rule is ignored', extract_domains('site.example##.ad') == [])
+check('dnsmasq zero-address block rule', extract_domains('address=/dns.example/0.0.0.0') == ['dns.example'])
+check('dnsmasq NODATA block rule', extract_domains('address=/dns.example/') == ['dns.example'])
+check('dnsmasq routing rule is not a block', extract_domains('server=/dns2.example/192.0.2.1') == [])
+check('dnsmasq non-blocking address is ignored', extract_domains('address=/mapped.example/192.0.2.1') == [])
+check('malformed hosts mapping ignored', extract_domains('not-an-ip malformed.example') == [])
+check('invalid hostname ignored', extract_domains('bad..example') == [])
+check('bare TLD ignored', extract_domains('com') == [])
+check('IPv4 literal is not a domain', norm('192.0.2.1') == '')
 
 # ---- optimal_k ----
 check('optimal_k(0, ...) = 0', optimal_k(0, 1024) == 0)
@@ -102,8 +121,10 @@ with open(test_bin, 'rb') as f:
 
 check('file >= header size', len(data) >= HEADER_SIZE)
 check('magic = CADB', data[0:4] == MAGIC)
-check('version = 1', data[4] == VERSION)
+check('version = 2', data[4] == VERSION)
 check('hash_bytes = 5', data[5] == HASH_BYTES)
+check('payload CRC-32 matches', struct.unpack('<I', data[15:19])[0] == zlib.crc32(data[HEADER_SIZE:]))
+check('reserved header byte is zero', data[19] == 0)
 
 num_hashes = struct.unpack('<I', data[6:10])[0]
 bloom_bits_read = struct.unpack('<I', data[10:14])[0]
@@ -129,6 +150,12 @@ for i in range(num_hashes):
     hashes.append(h)
 check('hashes are sorted', hashes == sorted(hashes))
 check('all hashes < 2^40', all(h < (1 << 40) for h in hashes))
+prefix_starts = [bisect_left(hashes, prefix << 32) for prefix in range(257)]
+check('prefix boundaries are monotonic',
+      all(prefix_starts[i] <= prefix_starts[i + 1] for i in range(256)))
+check('each hash falls in its MSB-prefix bucket',
+      all(prefix_starts[h >> 32] <= i < prefix_starts[(h >> 32) + 1]
+          for i, h in enumerate(hashes)))
 
 # Verify a known domain is in the hash table
 expected_hash = fnv40(b'ads.example.com')
@@ -138,9 +165,30 @@ check('ads.example.com hash in table', expected_hash in hashes)
 not_blocked = fnv40(b'google.com')
 check('google.com hash NOT in table', not_blocked not in hashes)
 
+# Empty or entirely invalid input must not replace an existing blocklist.
+with tempfile.NamedTemporaryFile(suffix='.txt', mode='w', delete=False) as tf:
+    tf.write('# no domains here\nnot-an-ip malformed.example\n')
+    invalid_source = tf.name
+with open(test_bin, 'wb') as f:
+    f.write(b'keep-existing')
+r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), 'build_blocklist.py'),
+                    test_bin, invalid_source],
+                   capture_output=True, text=True)
+check('empty input exits nonzero', r.returncode != 0)
+with open(test_bin, 'rb') as f:
+    check('empty input preserves prior output', f.read() == b'keep-existing')
+r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), 'build_blocklist.py'),
+                    test_bin, test_hosts, os.path.join(os.path.dirname(test_hosts), 'missing-source.txt')],
+                   capture_output=True, text=True)
+check('partial source failure exits nonzero', r.returncode != 0)
+with open(test_bin, 'rb') as f:
+    check('partial source failure preserves prior output', f.read() == b'keep-existing')
+check('temporary output removed on source failure', not os.path.exists(test_bin + '.tmp'))
+
 # ---- Cleanup ----
 os.unlink(test_bin)
 os.unlink(test_hosts)
+os.unlink(invalid_source)
 collisions_file = test_bin + '.collisions.txt'
 if os.path.exists(collisions_file):
     os.unlink(collisions_file)

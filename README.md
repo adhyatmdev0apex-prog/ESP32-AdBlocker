@@ -4,39 +4,49 @@
 > the original ESP32-C3 DNS ad-blocker. This version adds significant improvements
 > including Bloom filter, async forwarding, and a full web dashboard.
 
-A **Pi-hole-style DNS ad-blocker** that runs on a **$2 ESP32-C3** — *no PSRAM required*.
+A **Pi-hole-style DNS ad-blocker** for the ESP32-C3 and the classic ESP32 (`esp32dev`)
+— *no external PSRAM required*. The classic ESP32 environment is provided but has
+not yet been verified on hardware.
 
 The trick everyone misses: you don't need to keep the blocklist in RAM. Store the
-domains as **sorted 40-bit hashes in flash** and binary-search them. 140,000+ domains
-fit in ~0.7 MB of flash and are matched in **<1 ms** (with Bloom filter pre-filter),
-using **~180 KB of RAM** (including the 128 KB Bloom filter).
+domains as **sorted 40-bit hashes in flash** and binary-search them. Lookup latency,
+firmware size, and peak RAM depend on the selected blocklist and toolchain and have
+not been benchmarked for the classic ESP32 target.
 
 ## What's new in this version
 
-This is a heavily upgraded fork of the original `esp32-c3-adblock`. Every item from
-the original "how it could grow" list is done, plus a long list of correctness,
-performance, and security fixes:
+This is a fork of `esp32-c3-adblock` with a dashboard and additional DNS/blocklist
+features. The items below describe current implementation behavior, not a claim of
+complete standards compliance or measured performance.
 
 ### Performance
-- **Bloom filter in RAM** (128 KB) — skips flash for ~93% of non-blocked queries.
-  Average lookup is now **0 flash reads** instead of ~18.
-- **Async upstream forwarding** — up to 32 concurrent queries instead of blocking
-  on one upstream reply at a time. No more "one slow query freezes the sinkhole."
+- **Bloom filter in RAM** — a definite Bloom miss skips flash lookup; the hit rate
+  and resulting average flash reads depend on workload and have not been measured.
+- **MSB-prefix index** — a 256-bucket RAM index narrows flash binary search using
+  the high 8 bits of the sorted 40-bit integer hash. The blocklist is still scanned
+  at load time to validate ordering and build the index.
+- **Event-loop serviced upstream forwarding** — up to 32 pending queries instead of blocking
+  on one upstream reply at a time. Other synchronous work in the main loop (notably
+  TCP DNS and remote blocklist downloads) can still delay processing.
 - **Custom domains sorted + binary-searched** (was a linear scan of up to 200).
 - **Removed `delay(1)` from the main loop** — was capping throughput at ~1000 it/s.
-- **`isBlocked` uses `memchr` + length tracking** instead of `strlen` per suffix.
+- Domain suffix lookups use bounded parsing and a decision cache; timing improvement
+  has not been measured.
 
 ### Correctness
 - **AAAA sinkhole** — blocked IPv6 queries now answer `::` instead of leaking
   upstream. Was: only A records were sinkholed, AAAA bypassed the blocklist.
-- **TCP DNS on port 53** — handles truncated-response / DNSSEC fallback. Was UDP-only.
+- **TCP DNS listener on port 53** — accepts one DNS query per client connection.
+  The current upstream forwarder still uses UDP, so it is not a complete TCP-upstream
+  fallback for truncated answers.
 - **1232-byte DNS buffer** (RFC 6891 max UDP) — was 600, large replies were truncated.
 - **Client table with LRU eviction** — was silently dropping stats past 96 clients.
 - **Banned IPs decoupled from the client table** — banning an IP with no active
   client entry now persists correctly.
 - **Idle-gated remote blocklist fetch** — only runs when DNS has been quiet 3+ s,
-  so a 20-second HTTPS download no longer freezes the household's DNS.
-- **`millis()` wraparound-safe timing** — was broken every ~49 days of uptime.
+  which reduces interference; the download itself still runs synchronously and can
+  delay DNS requests that arrive after it starts.
+- **`millis()` elapsed-time checks** use unsigned subtraction for wraparound safety.
 - **`parseQuery` robust bounds checking** — was fragile on compression pointers.
 
 ### Security
@@ -45,18 +55,23 @@ performance, and security fixes:
   firmware or swap the blocklist.
 - **CSRF token** on all mutating endpoints — a malicious page on the LAN can't
   ban clients or upload firmware via the victim's browser.
-- **CA-verified HTTPS** for remote blocklist fetches — was `setInsecure()`, which
-  let a MITM swap your blocklist for an empty one (silently disabling blocking).
+- ArduinoOTA is password-protected with the dashboard password. The dashboard and
+  its Basic Auth still use plain HTTP; use only on a trusted network or VPN.
+- Firmware OTA checks the image structure/integrity but does not authenticate a
+  publisher signature. Do not accept untrusted firmware binaries.
+- **TLS verification remains enabled** for HTTPS remote blocklist fetches (`setInsecure()`
+  is not used); whether a CA bundle is available depends on the selected Arduino core
+  configuration and must be verified on the target.
 
 ### Features
-- **WiFiManager captive portal** — first-boot WiFi setup without recompiling.
+- **Captive portal** — first-boot WiFi setup without recompiling.
   Connect to the `C3AdBlock-Setup` AP, enter creds at `http://192.168.4.1`, done.
   WiFi can also be changed later from the dashboard.
 - **Optional DHCP server** — the C3 can hand itself out as DNS for true
   plug-and-play. Toggle from the dashboard (disable your router's DHCP first).
-- **Blocklist v1 binary format** with header (magic `CADB` + version + hash_bytes)
-  — the firmware validates on load, so a `HASH_BYTES` mismatch is rejected instead
-  of silently corrupting lookups.
+- **Blocklist v2 binary format** with a CRC-32 payload check; the firmware retains
+  read compatibility with v1. This detects accidental corruption, not malicious
+  replacement or publisher authenticity.
 - **Collision report** — `build_blocklist.py` writes `blocklist.bin.collisions.txt`
   listing any domain pairs sharing a 40-bit hash, so the operator can decide.
 - **ETag + Cache-Control** on the dashboard HTML — the 6 KB page is served with a
@@ -65,8 +80,8 @@ performance, and security fixes:
 
 ### Code quality
 - **Dashboard HTML extracted** to `src/dashboard_html.h` (was inline in `main.cpp`).
-- **33 Python tests** for hashing, normalization, binary format, and Bloom filter
-  correctness (`python3 tools/test_build_blocklist.py`).
+- Python tests cover hashing, normalization, supported input forms, the binary
+  format, and Bloom-filter primitives (`python3 tools/test_build_blocklist.py`).
 - **`LOG`/`LOGN` macros** — silence serial output with `-DNDEBUG`.
 - **Removed hardcoded `/dev/ttyACM0`** from `platformio.ini` — PlatformIO
   auto-detects the port.
@@ -75,19 +90,21 @@ performance, and security fixes:
 ### Build footprint
 | | original | this version |
 |---|---|---|
-| RAM | 54 KB | 56 KB (+2 KB for async pending table) |
-| Flash | 1018 KB | 1032 KB (+14 KB for TCP DNS, DHCP, auth, captive portal, Bloom loader) |
-| Lookups | ~18 flash reads/query | **0 flash reads** for 93% of queries |
-| Concurrent upstream queries | 1 | **32** |
+| Resource | Current status |
+|---|---|
+| RAM / firmware size | Not measured in this checkout for either target |
+| Lookup | Bloom misses bypass flash; positive Bloom results use prefix-bounded binary search |
+| Concurrent UDP upstream requests | Fixed table of 32; overflow returns SERVFAIL |
+| DNS timing / throughput | Not benchmarked |
 
 
 ```
 query in ──▶ extract domain ──▶ FNV-1a hash (+ parent suffixes)
-         ──▶ Bloom filter check (RAM, ~0.5 µs)
-              ├─ miss ──▶ forward to upstream (async, non-blocking)
-              └─ hit  ──▶ binary-search the flash hash table
+         ──▶ Bloom filter check (RAM; timing not benchmarked)
+              ├─ miss ──▶ queue upstream UDP request (event-loop serviced)
+              └─ hit  ──▶ prefix-bounded binary-search in the flash hash table
                           ├─ hit  ──▶ answer 0.0.0.0 / ::  (sinkholed)
-                          └─ miss ──▶ forward to upstream (async, non-blocking)
+                          └─ miss ──▶ queue upstream UDP request (event-loop serviced)
 ```
 
 ## Why this is interesting
@@ -98,11 +115,10 @@ with a **Bloom filter in RAM** as a fast pre-filter:
 
 | | string-in-RAM approach | this (hash-in-flash + bloom) |
 |---|---|---|
-| Hardware | ESP32 + PSRAM (~$8) | ESP32-C3, no PSRAM (~$2) |
-| 141k domains | ~2.5 MB of RAM | **0.67 MB of flash + 128 KB bloom** |
-| RAM used | most of it | **~180 KB** (bloom + stack) |
-| Lookup | string compare | **0 flash reads** for 93% of misses (bloom) |
-| Collisions | n/a | 0 at 141k (1 at 537k) |
+| Hardware | ESP32 + PSRAM (~$8) | ESP32-C3 / classic ESP32, no external PSRAM required |
+| Storage | Domain strings in RAM | Sorted 5-byte hashes in flash + optional Bloom filter in RAM |
+| Lookup | String compare | Bloom prefilter, then prefix-bounded binary search on possible matches |
+| Collisions | n/a | 40-bit hash collisions are possible; the builder reports observed collisions |
 | Upstream | blocking (1 query at a time) | **async (32 concurrent)** |
 
 **Why 40 bits?** It's the sweet spot for this flash budget. Collisions follow the
@@ -111,10 +127,9 @@ domain gets over-blocked). Dropping to 32 bits would save 20% of the flash but
 cost ~7 collisions at 250k; going to 64 bits wastes 3 bytes per domain to solve
 a problem you don't have.
 
-**Why a Bloom filter?** ~93% of DNS queries are for domains *not* in the blocklist.
-The Bloom filter (128 KB of RAM) eliminates flash access for those — only the ~7%
-that pass the bloom check do the ~18-flash-read binary search. Net result: the
-average query does **0 flash reads**, not 18.
+**Why a Bloom filter?** Definite Bloom misses avoid flash access. The fraction of
+queries that miss the filter is workload-dependent; this repository does not include
+a production query trace or benchmark establishing a specific average read count.
 
 The same trick works on bigger chips — it isn't a C3 workaround. On a 16 MB
 ESP32-S3 these hashes hold **~2.7M domains** vs ~466k for strings in 8 MB of
@@ -123,7 +138,8 @@ makes it undeniable.
 
 ## Hardware
 
-- Any **ESP32-C3** board (tested on a C3 SuperMini), 4 MB flash, **no PSRAM needed**
+- **ESP32-C3** board (tested on a C3 SuperMini) or classic ESP32-WROOM 4 MB flash;
+  external PSRAM is not required, and WROOM remains unverified on hardware
 - Power it from a **stable USB source** (a phone charger or your router's USB port).
   Cheap/loose USB-C→A adapters can brown out the radio during WiFi transmit.
 - A **USB-A → USB-C dongle** lets it plug straight into the spare USB port on the
@@ -235,11 +251,16 @@ You need [PlatformIO](https://platformio.org/) and Python 3.
    ```
    See `tools/build_blocklist.py --help` for custom lists and Bloom filter sizing.
 
-5. **Flash firmware + blocklist filesystem** (the one and only USB flash):
+5. **Build and flash the selected board environment:**
    ```bash
-   pio run -t upload
-   pio run -t uploadfs
+   pio run -e c3
+   pio run -e c3 -t upload
+   pio run -e c3 -t uploadfs
    ```
+   For a classic ESP32-WROOM module, use `-e esp32dev` instead of `-e c3`.
+   Both environments use the dual-OTA partition layout; confirm the firmware fits
+   the app slot before deploying. Automatic rollback after a bad app boot is not
+   implemented here. The WROOM environment has not yet been hardware-tested.
 
 6. **Continue to first-boot setup** below.
 
@@ -268,7 +289,8 @@ You need [PlatformIO](https://platformio.org/) and Python 3.
      ```
      [cfg] dashboard password: xY7kPm2nQa
      ```
-   - Write this down. You can also find it later in the LittleFS file `/auth.cfg`.
+   - Write this down now. It is stored in device flash for authentication but is
+     not exposed by the dashboard; if lost, use a physical factory reset.
 
 4. **Open the dashboard:**
    - Go to **http://c3adblock.local** in a browser (mDNS).
@@ -317,8 +339,9 @@ The dashboard at **http://c3adblock.local** does it all:
 - **Blocklist** — drop a freshly built `blocklist.bin` into *Blocklist → Upload*, or set a
   URL under *Remote auto-update* and the device pulls a prebuilt `blocklist.bin`
   on a schedule (e.g. a GitHub release asset — update it once, every device fetches it).
-  Remote fetches use **CA-verified HTTPS** (no `setInsecure`) and only run when DNS
-  has been idle for 3+ seconds, so they don't interrupt service.
+  HTTPS requests do not disable certificate verification; CA trust availability is
+  platform-dependent and not yet verified on hardware. Fetching starts after DNS
+  has been idle for 3+ seconds, but the synchronous download can delay DNS while active.
 - **Firmware** — upload `.pio/build/c3/firmware.bin` under *Firmware → OTA update*; the
   device verifies it and reboots into the new image. Or push over WiFi from the CLI:
   ```bash
@@ -351,25 +374,27 @@ filter first, and only on a Bloom hit is the flash hash table binary-searched.
 Custom domains (added via the dashboard) are kept in a separate sorted array and
 binary-searched too.
 
-## Blocklist binary format (v1)
+## Blocklist binary format (v2; firmware also reads v1)
 
 ```
 Header (20 bytes):
   [0..3]   magic 'CADB'
-  [4]      version (1)
+  [4]      version (2; version 1 remains readable)
   [5]      hash_bytes (5)
   [6..9]   num_hashes (uint32 LE)
   [10..13] bloom_bits (uint32 LE)
   [14]     bloom_k (uint8)
-  [15..19] reserved
+  [15..18] CRC-32 of Bloom filter + hash table (little-endian)
+  [19]     reserved (zero)
 
 Bloom filter: ceil(bloom_bits / 8) bytes
 Hash table:   num_hashes * 5 bytes (sorted, little-endian)
 ```
 
-The firmware validates the magic, version, and hash_bytes on load — a mismatch
-(e.g. wrong `HASH_BYTES`) is rejected instead of silently corrupting lookups.
-Collisions are reported to `blocklist.bin.collisions.txt` by the build script.
+The firmware checks the header, exact file size, sorted hash order, payload CRC
+(v2), and complete reads before replacing the active list. CRC-32 detects accidental
+corruption only; it is not a signature. Collisions are reported to
+`blocklist.bin.collisions.txt` by the build script.
 
 ## Gotchas (learned the hard way)
 
@@ -382,13 +407,16 @@ Collisions are reported to `blocklist.bin.collisions.txt` by the build script.
   ```
 - The C3's USB-Serial-JTAG console can swallow early boot output until the host
   connects (`while(!Serial)` helps).
-- DNS clients add an **EDNS OPT** record; a blocked reply must contain only the
-  question + answer (ANCOUNT=1, NSCOUNT=ARCOUNT=0) or it's malformed.
+- DNS clients can add an **EDNS OPT** record. Generated responses retain a minimal
+  OPT when the request included EDNS; verify packet counts and option handling with
+  the DNS tests and hardware packet captures.
 
 ## Testing
 
 ```bash
-python3 tools/test_build_blocklist.py    # 33 tests: hashing, normalization, binary format, bloom
+python3 tools/test_build_blocklist.py    # hashing, normalization, input formats, binary format, bloom
+g++ -std=c++11 -Wall -Wextra -Werror tools/test_dns_packet.cpp -o /tmp/test_dns_packet
+/tmp/test_dns_packet
 ```
 
 CI runs automatically on every push and PR via `.github/workflows/ci.yml` —
@@ -421,15 +449,18 @@ Releases with auto-generated release notes. Assets:
 - ✅ Web dashboard — per-client block/allow counts, ban a client, add custom domains
 - ✅ mDNS (`c3adblock.local`) for discovery
 - ✅ OTA — firmware + blocklist update over WiFi, plus scheduled remote blocklist pulls
-- ✅ Bloom filter in RAM as a fast pre-filter (skip flash for ~93% of misses)
+- ✅ Bloom filter in RAM as a fast pre-filter (definite misses skip flash)
 - ✅ Async upstream forwarding (32 concurrent queries, no blocking)
-- ✅ TCP DNS support (port 53)
+- ✅ TCP DNS client listener (upstream forwarding remains UDP-based)
 - ✅ AAAA sinkhole (blocked IPv6 queries answered with `::`, not leaked upstream)
 - ✅ Dashboard auth (Basic Auth + CSRF token)
-- ✅ WiFiManager captive portal (first-boot WiFi setup without recompiling)
+- ✅ Exact-name IPv4 A-record rewrites and persistent pause/resume
+- ✅ Prefix-bounded flash binary search and v2 CRC-checked blocklists
+- ✅ Classic ESP32 `esp32dev` PlatformIO environment (build/hardware fit still to verify)
+- ✅ Captive portal (first-boot WiFi setup without recompiling)
 - ✅ Optional DHCP server (hands out C3 as DNS for plug-and-play)
-- ✅ CA-verified HTTPS for remote blocklist fetches
-- ✅ Blocklist v1 format with header validation
+- ✅ HTTPS fetch path does not disable TLS verification (CA-bundle behavior unverified)
+- ✅ Blocklist v2 format with CRC and v1 read compatibility
 - ⬜ Per-client blocking rules (different blocklists for different devices)
 - ⬜ Allowlist (override blocklist for specific domains)
 - ⬜ Query logging / export

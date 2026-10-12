@@ -1,5 +1,48 @@
 # Changelog
 
+## [Unreleased] - 2026-10-12
+
+### Security and reliability
+- Authentication is forced on at boot; generated credentials remain serial-only.
+- Stats no longer expose the CSRF token or client/network details. Dashboard
+  mutations and captive-portal WiFi saving require CSRF tokens; dashboard mutations
+  use POST. ArduinoOTA now uses the dashboard password.
+- Config writes use staged files with backup/recovery, and report persistence
+  failures instead of silently claiming success.
+- Blocklist uploads and remote fetches validate before swapping, reject short or
+  oversized writes, and preserve the previous active list on validation failure.
+- Invalid blocklist state and flash lookup read faults are surfaced on the dashboard.
+- Remote blocklist URLs must use HTTPS; the firmware does not use `setInsecure()`.
+- DNS validates query and EDNS bounds, caps forwarded EDNS UDP size, preserves
+  request RD/CD bits in generated answers, and returns SERVFAIL for pending-query
+  overflow and upstream timeouts.
+
+### Added
+- Added a 16-entry, 30-second exact-name decision cache; an exact-name IPv4 A
+  rewrite table; persistent pause/resume; and a 256-bucket MSB-prefix index.
+- Blocklist builder emits v2 payload CRC-32, validates supported input forms,
+  ignores dnsmasq routing rules rather than converting them to blocks, and refuses
+  empty or partial-source outputs. Firmware keeps v1 read compatibility.
+- Added the classic ESP32 `esp32dev` environment and CI compilation for both targets.
+- Extracted the DNS query parser into a host-testable header and added packet cases
+  for A/AAAA/HTTPS types, EDNS/DO flags, EDNS options, malformed labels, and counts.
+
+### Files changed
+- `src/main.cpp`, `src/dashboard_html.h`
+- `src/dns_packet.h`
+- `tools/build_blocklist.py`, `tools/test_build_blocklist.py`, `tools/test_dns_packet.cpp`
+- `platformio.ini`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`
+- `README.md`, `CHANGELOG.md`
+
+### Testing
+- VS Code diagnostics reported no errors in the edited source/config files; this is
+  not a firmware compilation result.
+- VS Code diagnostics: no errors reported in the edited source files.
+- Python/C++ tests and PlatformIO builds were not run: the Windows sandbox rejected
+  PowerShell startup before commands could execute. Firmware-size, OTA rollback,
+  performance, and hardware tests also remain pending. Do not treat diagnostics as
+  build or test results.
+
 ## [1.5.0] - 2026-07-25
 
 ### Changed

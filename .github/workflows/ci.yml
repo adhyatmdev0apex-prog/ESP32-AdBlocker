@@ -25,11 +25,19 @@ jobs:
       - name: Create stub secrets.h
         run: cp src/secrets.example.h src/secrets.h
 
-      - name: Build firmware
-        run: pio run
+      - name: Build ESP32-C3 firmware
+        run: pio run -e c3
+
+      - name: Build classic ESP32 firmware
+        run: pio run -e esp32dev
 
       - name: Run blocklist tests
         run: python3 tools/test_build_blocklist.py
+
+      - name: Run DNS packet parser tests
+        run: |
+          g++ -std=c++11 -Wall -Wextra -Werror tools/test_dns_packet.cpp -o /tmp/test_dns_packet
+          /tmp/test_dns_packet
 
       - name: Build default blocklist
         run: |
@@ -37,7 +45,7 @@ jobs:
           python3 tools/build_blocklist.py data/blocklist.bin
 
       - name: Build filesystem image
-        run: pio run -t buildfs
+        run: pio run -e c3 -t buildfs
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v5

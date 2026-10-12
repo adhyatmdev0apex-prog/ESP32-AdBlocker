@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """Preprocess hosts/domain blocklists into a sorted truncated-FNV-1a hash blob
-with an embedded Bloom filter, for the ESP32-C3 ad-blocker.
+with an embedded Bloom filter for the ESP32 DNS ad-blocker.
 
-The output file format (v1):
+The output file format (v2; firmware remains able to read v1):
 
   Header (20 bytes):
     [0..3]   magic 'CADB' (0x43 0x41 0x44 0x42)
-    [4]      version (1)
+    [4]      version (2; firmware also reads version 1)
     [5]      hash_bytes (5 — must match firmware)
     [6..9]   num_hashes  (uint32 LE) — number of sorted hash entries
     [10..13] bloom_bits  (uint32 LE) — number of bits in the Bloom filter
     [14]     bloom_k     (uint8)     — number of hash functions per insert
-    [15..19] reserved    (5 zero bytes)
+    [15..18] CRC-32 of Bloom filter + hash table (little-endian)
+    [19]     reserved    (zero)
 
   Bloom filter: ceil(bloom_bits / 8) bytes
   Hash table:   num_hashes * hash_bytes bytes (sorted, little-endian)
 
-The Bloom filter is loaded into RAM on the device and used as a fast pre-filter:
-~93% of non-blocked queries skip the flash binary search entirely.
+The Bloom filter is loaded into RAM on the device and used as a fast pre-filter.
+Definite misses skip flash lookup; observed hit rates depend on the query workload.
 
 Usage: build_blocklist.py [out.bin] [src ...]
   src = local file or URL. With none given, downloads a balanced daily-driver set
@@ -32,7 +33,7 @@ Usage: build_blocklist.py [out.bin] [src ...]
   --bloom-bits N   override Bloom filter size (default: 1048576 = 128 KB)
   --no-bloom       skip Bloom filter (header bloom_bits=0)
 """
-import sys, os, math, urllib.request, argparse
+import sys, os, math, urllib.request, argparse, ipaddress, re, zlib
 
 HASH_BYTES = 5                          # 40-bit hashes — must match firmware
 MASK = (1 << (HASH_BYTES * 8)) - 1
@@ -40,7 +41,7 @@ FNV_OFFSET = 0xcbf29ce484222325
 FNV_PRIME  = 0x100000001b3
 U64 = (1 << 64) - 1
 MAGIC = b'CADB'
-VERSION = 1
+VERSION = 2
 HEADER_SIZE = 20
 
 DEFAULT_BLOOM_BITS = 1 << 20            # 128 KB — good for up to ~250k domains
@@ -62,8 +63,76 @@ def fnv40(b: bytes) -> int:
     return fnv64(b) & MASK
 
 def norm(d: str) -> str:
-    d = d.strip().lower().lstrip('*').lstrip('.').rstrip('.')
-    return d[4:] if d.startswith('www.') else d
+    d = d.strip().lower().rstrip('.')
+    if d.startswith('*.'):
+        d = d[2:]
+    elif d.startswith('.'):
+        d = d[1:]
+    if d.startswith('www.'):
+        d = d[4:]
+    try:
+        d = d.encode('idna').decode('ascii')
+    except UnicodeError:
+        return ''
+    if not d or len(d) > 253:
+        return ''
+    labels = d.split('.')
+    if len(labels) < 2 or any(
+        not label or len(label) > 63 or label.startswith('-') or label.endswith('-') or
+        any(not (ch.isascii() and (ch.isalnum() or ch == '-')) for ch in label)
+        for label in labels
+    ):
+        return ''
+    try:
+        ipaddress.ip_address(d)
+        return ''
+    except ValueError:
+        return d
+
+def extract_domains(line: str):
+    line = line.strip().lstrip('\ufeff')
+    if '##' in line or '#@#' in line or (line.startswith('||') and '#' in line):
+        return []
+    line = line.split('#', 1)[0].strip()
+    if not line or line.startswith(('!', '#', '[Adblock', '@@', '##', '#@#')):
+        return []
+
+    if line.startswith('||'):
+        match = re.fullmatch(r'\|\|([A-Za-z0-9.-]+)\^(?:\$[A-Za-z0-9_,=-]+)?', line)
+        if not match:
+            return []
+        domain = norm(match.group(1))
+        return [domain] if domain else []
+
+    if line.startswith('address=/'):
+        pieces = line.split('/')
+        if len(pieces) == 3 and pieces[0] == 'address=':
+            domain = norm(pieces[1])
+            address = pieces[2].strip().lower()
+            if domain and address in ('', '#', '0.0.0.0', '::'):
+                return [domain]
+        return []
+
+    if line.startswith('server=/'):
+        return []
+
+    # Hosts syntax accepts any valid IPv4/IPv6 address followed by hostnames.
+    parts = line.split()
+    if not parts:
+        return []
+    try:
+        ipaddress.ip_address(parts[0])
+    except ValueError:
+        if len(parts) != 1:
+            return []
+        domain = norm(parts[0])
+        return [domain] if domain else []
+    domains = []
+    for candidate in parts[1:]:
+        domain = norm(candidate)
+        if domain:
+            domains.append(domain)
+    return domains
 
 def read_source(src: str) -> str:
     if os.path.exists(src):
@@ -97,25 +166,24 @@ def main():
 
     sources = args.sources if args.sources else DEFAULT_SOURCES
     bloom_bits = 0 if args.no_bloom else args.bloom_bits
+    if bloom_bits < 0 or bloom_bits > (1 << 21):
+        ap.error('--bloom-bits must be between 0 and 2097152')
 
     domains = set()
+    failed_sources = []
     for src in sources:
         try:
             data = read_source(src)
         except Exception as e:
             print(f'  !! skipped {src}: {e}', file=sys.stderr)
+            failed_sources.append(src)
             continue
         for line in data.splitlines():
-            line = line.split('#', 1)[0].strip()
-            if not line or line[0] in '!/':
-                continue
-            parts = line.split()
-            d = parts[1] if len(parts) >= 2 and parts[0] in ('0.0.0.0','127.0.0.1','::1','::') \
-                else parts[0] if len(parts) == 1 else None
-            if d:
-                d = norm(d)
-                if '.' in d and ' ' not in d:
-                    domains.add(d)
+            domains.update(extract_domains(line.split('#', 1)[0]))
+    if failed_sources:
+        ap.error('one or more sources failed; refusing to emit a partial blocklist')
+    if not domains:
+        ap.error('no valid domains found; refusing to create an empty blocklist')
 
     # Compute 40-bit hashes for the sorted flash table
     domain_list = sorted(domains)
@@ -126,7 +194,8 @@ def main():
 
     uniq_hashes = sorted(hash_to_domains.keys())
     num_hashes = len(uniq_hashes)
-    collisions = num_hashes - len(uniq_hashes)  # always 0 since we dedup
+    if num_hashes == 0:
+        bloom_bits = 0
     colliding_domains = []
     for h, doms in hash_to_domains.items():
         if len(doms) > 1:
@@ -144,19 +213,27 @@ def main():
         bloom_bytes = bloom_arr
 
     # Write binary: header + bloom + hash table
-    with open(args.out, 'wb') as f:
-        header = bytearray(HEADER_SIZE)
-        header[0:4] = MAGIC
-        header[4] = VERSION
-        header[5] = HASH_BYTES
-        header[6:10] = num_hashes.to_bytes(4, 'little')
-        header[10:14] = bloom_bits.to_bytes(4, 'little')
-        header[14] = k
-        f.write(header)
-        if bloom_bytes:
-            f.write(bloom_bytes)
-        for h in uniq_hashes:
-            f.write(h.to_bytes(HASH_BYTES, 'little'))
+    hash_bytes = b''.join(h.to_bytes(HASH_BYTES, 'little') for h in uniq_hashes)
+    payload = bytes(bloom_bytes) + hash_bytes
+    header = bytearray(HEADER_SIZE)
+    header[0:4] = MAGIC
+    header[4] = VERSION
+    header[5] = HASH_BYTES
+    header[6:10] = num_hashes.to_bytes(4, 'little')
+    header[10:14] = bloom_bits.to_bytes(4, 'little')
+    header[14] = k
+    header[15:19] = zlib.crc32(payload).to_bytes(4, 'little')
+    temp_out = args.out + '.tmp'
+    try:
+        with open(temp_out, 'wb') as f:
+            f.write(header)
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_out, args.out)
+    finally:
+        if os.path.exists(temp_out):
+            os.unlink(temp_out)
 
     blob_size = HEADER_SIZE + len(bloom_bytes) + num_hashes * HASH_BYTES
     bloom_kb = len(bloom_bytes) / 1024

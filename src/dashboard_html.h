@@ -34,6 +34,11 @@ details[open] summary{border-bottom:1px solid #30363d}
 <h2>CUSTOM BLOCKED DOMAINS</h2>
 <div style=margin-bottom:8px><input id=dom placeholder="ads.example.com" size=30><button onclick=addDom()>Block domain</button></div>
 <table id=cl><tbody></tbody></table>
+<h2>LOCAL A RECORD REWRITES</h2>
+<div style=margin-bottom:8px><input id=rwdom placeholder="printer.example.lan" size=30>
+<input id=rwip placeholder="192.168.1.20" size=16><button onclick=addRewrite()>Save rewrite</button></div>
+<table id=rwtable><tbody></tbody></table>
+<div style="color:#8b949e;font-size:12px">Exact-name A records only. Rewrites override domain blocks; client bans still take precedence.</div>
 
 <details open>
 <summary>Blocklist</summary>
@@ -51,24 +56,25 @@ details[open] summary{border-bottom:1px solid #30363d}
 <summary>Network</summary>
 <div class=detail-body>
 <h2 style=margin-top:0>WIFI NETWORK</h2>
-<div style=margin-bottom:6px>Current: <span id=wifi style=color:#3fb950></span></div>
 <div style=margin-bottom:18px><input id=wssid placeholder="New SSID" size=20> <input id=wpass type=password placeholder="New password" size=20>
 <button onclick=saveWifi()>Change WiFi</button> <span id=wmsg style=color:#8b949e></span></div>
 <h2>DHCP SERVER <span id=dhcpst class=tag></span></h2>
 <div><button onclick=toggleDhcp()>Enable / Disable DHCP</button>
 <span style="color:#8b949e;font-size:12px;margin-left:8px">disables router DHCP for you &mdash; C3 hands out its own IP as DNS</span></div>
+<h2>BLOCKING</h2>
+<div><button onclick=togglePause() id=pausebtn>Pause blocking</button> <span id=pausest class=tag></span>
+<span style="color:#8b949e;font-size:12px;margin-left:8px">domain blocks and bans pause; configured rewrites remain active</span></div>
 </div></details>
 
 <details open>
 <summary>Security</summary>
 <div class=detail-body>
 <h2 style=margin-top:0>DASHBOARD PASSWORD</h2>
-<div style=margin-bottom:6px><input id=pwcur type=password placeholder="Current password (not needed if auth disabled)" size=30> <input id=pwnew type=password placeholder="New password" size=20> <input id=pwcfm type=password placeholder="Confirm new password" size=20>
+<div style=margin-bottom:6px><input id=pwcur type=password placeholder="Current password" size=30> <input id=pwnew type=password placeholder="New password" size=20> <input id=pwcfm type=password placeholder="Confirm new password" size=20>
 <button onclick=savePw()>Change Password</button> <span id=pwmsg style=color:#8b949e></span></div>
 <div style="color:#8b949e;font-size:12px;margin-bottom:12px">min 6 characters &mdash; you'll need the new password for your next login</div>
-<div>Web authentication: <span id=authst class=tag></span>
-<button onclick=toggleAuth() id=authbtn>Enable / Disable Auth</button>
-<div style="color:#f85149;font-size:12px;margin-top:4px">WARNING: Anyone on your network can flash firmware and change settings when auth is disabled</div></div>
+<div>Web authentication: <span id=authst class=tag>REQUIRED</span>
+<div style="color:#8b949e;font-size:12px;margin-top:4px">Authentication is always required. On first boot, retrieve the generated password from the serial console.</div></div>
 </div></details>
 
 <details>
@@ -76,7 +82,7 @@ details[open] summary{border-bottom:1px solid #30363d}
 <div class=detail-body>
 <h2 style=margin-top:0>FIRMWARE &mdash; OTA UPDATE</h2>
 <form id=fwf style=margin-bottom:6px><input type=file id=fwb accept=.bin><button>Flash firmware</button> <span id=fwmsg style=color:#8b949e></span></form>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">select a <code>firmware.bin</code> built from <a href="https://github.com/engkon6/ESP32-C3-AdBlocker" target="_blank" style=color:#58a6ff>source</a> for your board &mdash; device verifies it and reboots into it</div>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">select a <code>firmware.bin</code> built from <a href="https://github.com/engkon6/ESP32-C3-AdBlocker" target="_blank" style=color:#58a6ff>source</a> for your board &mdash; image integrity is checked, but firmware authenticity is not signature-verified</div>
 <h2>FACTORY RESET</h2>
 <div style=margin-bottom:6px"><input id=rstconfirm placeholder="Type RESET" size=12>
 <button onclick=factoryReset()>Erase all settings</button> <span id=rstmsg style=color:#8b949e></span></div>
@@ -86,49 +92,52 @@ details[open] summary{border-bottom:1px solid #30363d}
 </div><script>
 let T='';
 function fmt(n){return n.toLocaleString()}
-function mut(p){return p+(p.includes('?')?'&':'?')+'token='+T}
-async function load(){let s=await(await fetch('/stats.json')).json();
-T=s.token||'';
-host.textContent='@ '+s.ip;
+async function post(path,data={}){return fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-CSRF-Token':T},body:new URLSearchParams(data)})}
+async function load(){let [sr,cr,dr]=await Promise.all([fetch('/stats.json'),fetch('/csrf'),fetch('/dashboard-data.json')]);
+if(!sr.ok||!cr.ok||!dr.ok)return;
+let s=await sr.json(),d=await dr.json();T=(await cr.text()).trim();
+host.textContent='@ '+d.ip;
 sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-['Bloom',s.bloom||'off',''],['Pending',s.pending||0,''],['Clients',s.clients.length,''],
-['WiFi',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
+['Bloom',s.bloom||'off',''],['Pending',s.pending||0,''],['Clients',s.clients,''],
+['Rewrites',s.rewriteCount,''],['Temp',s.temp+' C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
+ .concat([['Blocklist status',s.blocklistReadError?'READ ERROR':(s.blocklistValid?'valid':'INVALID'),
+ s.blocklistValid&&!s.blocklistReadError?'':'b']])
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
-ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
+ct.tBodies[0].innerHTML=d.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
 `<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=ban onclick="fetch(mut('/ban?ip=${c.ip}')).then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
-cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${d}</td><td style=text-align:right><button onclick="fetch(mut('/unblock?d='+encodeURIComponent('${d}')).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
-if(document.activeElement!=uurl)uurl.value=s.upurl||'';
-if(document.activeElement!=uiv)uiv.value=s.upiv||24;
-ustat.textContent=s.upstat||'—';
-dhcpst.textContent=s.dhcp?'ON':'OFF';
-dhcpst.style.color=s.dhcp?'#3fb950':'#8b949e';
-authst.textContent=s.auth?'ENABLED':'DISABLED';
-authst.style.color=s.auth?'#3fb950':'#f85149';
-wifi.textContent=s.wifi||'—';}
-function addDom(){let d=dom.value.trim();if(d){fetch(mut('/addblock?d='+encodeURIComponent(d))).then(()=>{dom.value='';load()})}}
-function saveUpd(){fetch(mut('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24))).then(load)}
-function fetchNow(){ustat.textContent='fetching...';fetch(mut('/fetchnow')).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
-function toggleDhcp(){fetch(mut('/dhcp')).then(r=>r.text()).then(t=>{alert(t);load()})}
-function saveWifi(){let s=wssid.value.trim(),p=wpass.value.trim();if(!s){wmsg.textContent='enter SSID';return}
-wmsg.textContent='saving...';fetch(mut('/setwifi?ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p))).then(r=>r.text()).then(t=>{wmsg.textContent=t;})}
+<td><button class=ban onclick="post('/ban',{ip:'${c.ip}'}).then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
+cl.tBodies[0].innerHTML=d.custom.map(x=>`<tr><td>${x}</td><td style=text-align:right><button onclick="post('/unblock',{d:'${x}'}).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
+rwtable.tBodies[0].innerHTML=d.rewrites.map(x=>`<tr><td>${x.domain}</td><td>${x.ip}</td><td style=text-align:right><button onclick="post('/removerewrite',{d:'${x.domain}'}).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
+if(document.activeElement!=uurl)uurl.value=d.upurl||'';
+if(document.activeElement!=uiv)uiv.value=d.upiv||24;
+ustat.textContent=s.upstat||'—';dhcpst.textContent=s.dhcp?'ON':'OFF';
+dhcpst.style.color=s.dhcp?'#3fb950':'#8b949e';authst.textContent='REQUIRED';
+pausest.textContent=s.paused?'PAUSED':'ACTIVE';pausest.style.color=s.paused?'#f85149':'#3fb950';
+pausebtn.textContent=s.paused?'Resume blocking':'Pause blocking';}
+function addDom(){let x=dom.value.trim();if(x){post('/addblock',{d:x}).then(r=>r.ok?load():r.text().then(alert));dom.value=''}}
+function addRewrite(){let d=rwdom.value.trim(),ip=rwip.value.trim();if(d&&ip)post('/addrewrite',{d,ip}).then(r=>r.ok?load():r.text().then(alert))}
+function saveUpd(){post('/setupdate',{u:uurl.value.trim(),h:String(parseInt(uiv.value)||24)}).then(load)}
+function fetchNow(){ustat.textContent='fetching...';post('/fetchnow').then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
+function toggleDhcp(){post('/dhcp').then(r=>r.text()).then(t=>{alert(t);load()})}
+function togglePause(){post('/pause',{paused:pausest.textContent==='PAUSED'?'0':'1'}).then(load)}
+function saveWifi(){let s=wssid.value.trim(),p=wpass.value;if(!s){wmsg.textContent='enter SSID';return}
+wmsg.textContent='saving...';post('/setwifi',{ssid:s,pass:p}).then(r=>r.text()).then(t=>{wmsg.textContent=t;})}
 function savePw(){let c=pwcur.value.trim(),n=pwnew.value.trim(),m=pwcfm.value.trim();
 if(!c||!n){pwmsg.textContent='fill all fields';return}
 if(n.length<6){pwmsg.textContent='min 6 characters';return}
 if(n!==m){pwmsg.textContent='passwords do not match';return}
-pwmsg.textContent='saving...';fetch(mut('/setpassword?current='+encodeURIComponent(c)+'&newpass='+encodeURIComponent(n)+'&confirm='+encodeURIComponent(m))).then(r=>r.text()).then(t=>{pwmsg.textContent=t;if(t==='password changed successfully'){pwcur.value='';pwnew.value='';pwcfm.value='';}})}
-function toggleAuth(){fetch(mut('/toggleauth')).then(r=>r.text()).then(t=>{load()})}
+pwmsg.textContent='saving...';post('/setpassword',{current:c,newpass:n,confirm:m}).then(r=>r.text()).then(t=>{pwmsg.textContent=t;if(t==='password changed successfully'){pwcur.value='';pwnew.value='';pwcfm.value='';}})}
 function factoryReset(){let c=rstconfirm.value.trim();if(c!=='RESET'){rstmsg.textContent='type RESET to confirm';return}
-rstmsg.textContent='erasing...';fetch(mut('/factoryreset?confirm='+encodeURIComponent(c))).then(r=>r.text()).then(t=>{rstmsg.textContent=t;})}
+rstmsg.textContent='erasing...';post('/factoryreset',{confirm:c}).then(r=>r.text()).then(t=>{rstmsg.textContent=t;})}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);
-try{let r=await fetch(mut('/update'),{method:'POST',body:fd});fwmsg.textContent=r.ok?'rebooting, reconnect in ~15s':'failed: '+await r.text();}
+try{let r=await fetch('/update',{method:'POST',headers:{'X-CSRF-Token':T},body:fd});fwmsg.textContent=r.ok?'rebooting, reconnect in ~15s':'failed: '+await r.text();}
 catch(_){fwmsg.textContent='rebooting, reconnect in ~15s';}};
 upf.onsubmit=async e=>{e.preventDefault();let f=blf.files[0];if(!f)return;
 upmsg.textContent='uploading '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);
-try{let r=await fetch(mut('/upload'),{method:'POST',body:fd});upmsg.textContent=r.ok?'updated':'failed: '+await r.text();}
+try{let r=await fetch('/upload',{method:'POST',headers:{'X-CSRF-Token':T},body:fd});upmsg.textContent=r.ok?'updated':'failed: '+await r.text();}
 catch(_){upmsg.textContent='upload failed';}
 blf.value='';setTimeout(load,600);};
 load();setInterval(load,3000);
@@ -145,6 +154,7 @@ h1{font-size:20px}p{color:#8b949e}
 <h1>C3 AdBlock Setup</h1>
 <p>Connect this device to your WiFi network.</p>
 <form action=/save-wifi method=post>
+<input type=hidden name=csrf value="__CSRF__">
 <input name=ssid placeholder="WiFi name" required>
 <input name=pass type=password placeholder="WiFi password" required>
 <button>Connect</button>
